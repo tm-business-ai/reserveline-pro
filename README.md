@@ -109,7 +109,13 @@ cd "C:\Users\あなたのユーザー名\Desktop\reserveline-pro"
 仮想環境を作成します。
 
 ```powershell
-py -3.11 -m venv .venv
+python -m venv .venv
+```
+
+Python Launcherでバージョンを指定する場合は、インストール済みのPython 3.11以上を指定してください。
+
+```powershell
+py -3 -m venv .venv
 ```
 
 仮想環境を有効化します。
@@ -148,6 +154,12 @@ BUSINESS_OPEN_TIME=09:00
 BUSINESS_CLOSE_TIME=18:00
 BUSINESS_DAYS=mon,tue,wed,thu,fri,sat
 BUSINESS_TIMEZONE=Asia/Tokyo
+```
+
+PowerShellで `.env` を書き換える場合は、UTF-8で保存してください。
+
+```powershell
+(Get-Content -Encoding UTF8 .env) -replace '^ADMIN_PASSWORD=.*$', 'ADMIN_PASSWORD=1234' | Set-Content -Encoding UTF8 .env
 ```
 
 LINE Messaging APIに接続する場合だけ、次を `.env` に設定します。
