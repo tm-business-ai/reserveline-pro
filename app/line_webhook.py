@@ -116,12 +116,14 @@ def create_reservation_from_message(
         }
 
     try:
+        existing_reservations = service.find_future_reservations_for_customer(line_user_id=user_id)
         reservation = service.create_reservation(
             ReservationInput(
                 customer_name=display_name or "LINEユーザー",
                 line_user_id=user_id,
                 menu=menu,
                 reservation_datetime=reservation_dt,
+                reservation_source="line",
                 notes=notes,
             )
         )
@@ -131,8 +133,12 @@ def create_reservation_from_message(
             "action": "create_failed",
         }
 
+    duplicate_notice = ""
+    if existing_reservations:
+        duplicate_notice = "すでに別の予約があります。重複登録でないかご確認ください。\n"
+
     return {
-        "reply_text": "ご予約を受け付けました。\n" + format_reservation(reservation),
+        "reply_text": duplicate_notice + "ご予約を受け付けました。\n" + format_reservation(reservation),
         "action": "create",
         "reservation": reservation,
     }

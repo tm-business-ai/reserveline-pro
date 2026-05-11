@@ -37,6 +37,8 @@ def init_db(db_path: str | None = None, settings: Settings | None = None) -> Non
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_name TEXT NOT NULL,
                 line_user_id TEXT NOT NULL,
+                customer_phone TEXT DEFAULT '',
+                reservation_source TEXT DEFAULT 'admin',
                 menu TEXT NOT NULL,
                 reservation_datetime TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'reserved',
@@ -47,6 +49,8 @@ def init_db(db_path: str | None = None, settings: Settings | None = None) -> Non
             )
             """
         )
+        _ensure_column(conn, "reservations", "customer_phone", "TEXT DEFAULT ''")
+        _ensure_column(conn, "reservations", "reservation_source", "TEXT DEFAULT 'admin'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS menus (
@@ -127,3 +131,9 @@ def init_db(db_path: str | None = None, settings: Settings | None = None) -> Non
             """,
             default_menus,
         )
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")

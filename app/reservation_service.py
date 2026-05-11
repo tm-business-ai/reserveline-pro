@@ -14,6 +14,15 @@ from app.settings import Settings, get_settings
 
 VALID_STATUSES = {"reserved", "confirmed", "pending", "completed", "cancelled", "no_show"}
 CONFLICT_STATUSES = {"reserved", "confirmed", "pending"}
+RESERVATION_SOURCE_LABELS = {
+    "line": "LINE",
+    "phone": "電話",
+    "walk_in": "店頭",
+    "admin": "管理画面",
+    "other": "その他",
+    "": "未設定",
+    None: "未設定",
+}
 STATUS_LABELS = {
     "reserved": "予約中",
     "confirmed": "確定",
@@ -32,6 +41,8 @@ class ReservationInput:
     line_user_id: str
     menu: str
     reservation_datetime: datetime
+    customer_phone: str = ""
+    reservation_source: str = "admin"
     notes: str = ""
 
 
@@ -61,8 +72,6 @@ class ReservationService:
     def create_reservation(self, data: ReservationInput) -> dict[str, Any]:
         if not data.customer_name.strip():
             raise ValueError("顧客名が空です。")
-        if not data.line_user_id.strip():
-            raise ValueError("LINEユーザーIDが空です。")
         if not self.menu_exists(data.menu):
             raise ValueError(f"メニューが見つかりません: {data.menu}")
 
@@ -75,12 +84,23 @@ class ReservationService:
             cur = conn.execute(
                 """
                 INSERT INTO reservations
-                    (customer_name, line_user_id, menu, reservation_datetime, status, notes)
-                VALUES (?, ?, ?, ?, 'reserved', ?)
+                    (
+                        customer_name,
+                        line_user_id,
+                        customer_phone,
+                        reservation_source,
+                        menu,
+                        reservation_datetime,
+                        status,
+                        notes
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)
                 """,
                 (
                     data.customer_name.strip(),
                     data.line_user_id.strip(),
+                    data.customer_phone.strip(),
+                    self.normalize_reservation_source(data.reservation_source),
                     data.menu.strip(),
                     data.reservation_datetime.replace(tzinfo=None).isoformat(timespec="minutes"),
                     data.notes.strip(),
@@ -214,6 +234,12 @@ class ReservationService:
             row = conn.execute("SELECT * FROM closed_dates WHERE id = ?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
+    def delete_closed_date(self, closed_date_id: int) -> None:
+        with get_connection(self.db_path) as conn:
+            cur = conn.execute("DELETE FROM closed_dates WHERE id = ?", (closed_date_id,))
+            if cur.rowcount == 0:
+                raise ValueError(f"臨時休業日が見つかりません: {closed_date_id}")
+
     def list_closed_dates(self, active_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM closed_dates"
         if active_only:
@@ -323,12 +349,56 @@ class ReservationService:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
+    def find_future_reservations_for_customer(
+        self,
+        *,
+        line_user_id: str = "",
+        customer_phone: str = "",
+        customer_name: str = "",
+        exclude_reservation_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        key_column = ""
+        key_value = ""
+        if line_user_id.strip():
+            key_column = "line_user_id"
+            key_value = line_user_id.strip()
+        elif customer_phone.strip():
+            key_column = "customer_phone"
+            key_value = customer_phone.strip()
+        elif customer_name.strip():
+            key_column = "customer_name"
+            key_value = customer_name.strip()
+        else:
+            return []
+
+        now = self._now().replace(tzinfo=None).isoformat(timespec="minutes")
+        placeholders = ",".join("?" for _ in CONFLICT_STATUSES)
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM reservations
+                WHERE {key_column} = ?
+                  AND status IN ({placeholders})
+                  AND reservation_datetime >= ?
+                  AND (? IS NULL OR id != ?)
+                ORDER BY reservation_datetime ASC, id ASC
+                """,
+                (
+                    key_value,
+                    *sorted(CONFLICT_STATUSES),
+                    now,
+                    exclude_reservation_id,
+                    exclude_reservation_id,
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_today(self) -> list[dict[str, Any]]:
-        today = date.today()
+        today = self._now().date()
         return self.list_reservations(start_date=today, end_date=today)
 
     def list_this_week(self) -> list[dict[str, Any]]:
-        today = date.today()
+        today = self._now().date()
         end = today + timedelta(days=6)
         return self.list_reservations(start_date=today, end_date=end)
 
@@ -442,6 +512,7 @@ class ReservationService:
                         line_user_id=line_user_id,
                         menu=menu,
                         reservation_datetime=reservation_dt,
+                        reservation_source="line",
                         notes=DEMO_RESERVATION_NOTE,
                     )
                 )
@@ -455,6 +526,8 @@ class ReservationService:
             "id",
             "customer_name",
             "line_user_id",
+            "customer_phone",
+            "reservation_source",
             "menu",
             "reservation_datetime",
             "status",
@@ -474,7 +547,8 @@ class ReservationService:
         field_map = [
             ("id", "予約ID"),
             ("customer_name", "顧客名"),
-            ("line_user_id", "LINEユーザーID"),
+            ("customer_phone", "電話番号"),
+            ("reservation_source", "予約経路"),
             ("menu", "メニュー"),
             ("reservation_datetime", "予約日時"),
             ("status", "予約状態"),
@@ -490,6 +564,8 @@ class ReservationService:
                 {
                     label: STATUS_LABELS.get(reservation.get(key), reservation.get(key, ""))
                     if key == "status"
+                    else self.format_reservation_source(reservation.get(key))
+                    if key == "reservation_source"
                     else "送信済み"
                     if key == "reminder_sent" and bool(reservation.get(key))
                     else "未送信"
@@ -499,6 +575,22 @@ class ReservationService:
                 }
             )
         return output.getvalue()
+
+    def format_reservation_source(self, source: object) -> str:
+        return RESERVATION_SOURCE_LABELS.get(source, str(source) if source else "未設定")
+
+    def normalize_reservation_source(self, source: str) -> str:
+        clean_source = (source or "").strip()
+        return clean_source if clean_source in RESERVATION_SOURCE_LABELS and clean_source else "admin"
+
+    def format_reservation_option(self, reservation: dict[str, Any]) -> str:
+        status = STATUS_LABELS.get(reservation.get("status"), str(reservation.get("status", "")))
+        source = self.format_reservation_source(reservation.get("reservation_source"))
+        reservation_dt = str(reservation.get("reservation_datetime", "")).replace("T", " ")
+        return (
+            f"#{reservation.get('id')}｜{reservation_dt}｜{reservation.get('customer_name', '')}"
+            f"｜{reservation.get('menu', '')}｜{status}｜{source}"
+        )
 
     def list_menus(self, active_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM menus"

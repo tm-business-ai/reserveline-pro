@@ -47,6 +47,17 @@ def test_handle_create_confirm_cancel(tmp_path):
     assert cancelled["reservation"]["status"] == "cancelled"
 
 
+def test_line_reservation_source_is_line(tmp_path):
+    service = make_service(tmp_path)
+    target = FIXED_NOW + timedelta(days=1, hours=1)
+    message = f"予約 30分相談 {target:%Y-%m-%d} {target:%H:%M}"
+
+    created = handle_user_message("user-001", message, "山田", service)
+
+    assert created["action"] == "create"
+    assert created["reservation"]["reservation_source"] == "line"
+
+
 def test_invalid_reservation_format(tmp_path):
     service = make_service(tmp_path)
     result = handle_user_message("user-001", "予約 30分相談", "山田", service)

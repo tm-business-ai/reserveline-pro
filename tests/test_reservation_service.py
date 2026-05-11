@@ -259,6 +259,104 @@ def test_available_slots_include_open_slots_when_no_conflict(tmp_path):
     assert slots == ["09:00", "09:30", "10:00"]
 
 
+def test_available_slots_include_end_boundary_for_30_minute_menu(tmp_path):
+    service = make_service(tmp_path)
+
+    slots = service.list_available_slots(date(2026, 5, 18), "30分相談")
+
+    assert "17:30" in slots
+
+
+def test_available_slots_use_menu_duration_for_60_minute_menu(tmp_path):
+    service = make_service(tmp_path)
+
+    slots = service.list_available_slots(date(2026, 5, 18), "60分相談")
+
+    assert "17:00" in slots
+    assert "17:30" not in slots
+
+
+def test_available_slots_change_by_menu_duration(tmp_path):
+    service = make_service(tmp_path)
+    service.upsert_menu("90分相談", duration_minutes=90, active=True, display_order=4)
+
+    slots_30 = service.list_available_slots(date(2026, 5, 18), "30分相談")
+    slots_60 = service.list_available_slots(date(2026, 5, 18), "60分相談")
+    slots_90 = service.list_available_slots(date(2026, 5, 18), "90分相談")
+
+    assert "17:30" in slots_30
+    assert "17:30" not in slots_60
+    assert "16:30" in slots_90
+    assert "17:00" not in slots_90
+
+
+def test_closed_date_can_be_disabled_and_deleted(tmp_path):
+    service = make_service(tmp_path)
+    closed = service.add_closed_date(date(2026, 5, 18), "臨時休業", active=True)
+
+    assert service.is_closed_date(date(2026, 5, 18)) is True
+    disabled = service.update_closed_date_status(int(closed["id"]), False)
+    assert disabled["active"] == 0
+    assert service.is_closed_date(date(2026, 5, 18)) is False
+
+    service.delete_closed_date(int(closed["id"]))
+    assert service.list_closed_dates(active_only=False) == []
+
+
+def test_create_reservation_saves_customer_phone_and_reservation_source(tmp_path):
+    service = make_service(tmp_path)
+
+    reservation = service.create_reservation(
+        ReservationInput(
+            customer_name="山田太郎",
+            line_user_id="",
+            menu="30分相談",
+            reservation_datetime=datetime(2026, 5, 18, 10, 0),
+            customer_phone="090-0000-0000",
+            reservation_source="phone",
+        )
+    )
+
+    assert reservation["customer_phone"] == "090-0000-0000"
+    assert reservation["reservation_source"] == "phone"
+
+
+def test_find_future_reservations_for_same_customer(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput(
+            customer_name="山田太郎",
+            line_user_id="",
+            menu="30分相談",
+            reservation_datetime=datetime(2026, 5, 18, 10, 0),
+            customer_phone="090-0000-0000",
+            reservation_source="phone",
+        )
+    )
+
+    matches = service.find_future_reservations_for_customer(
+        customer_phone="090-0000-0000",
+        customer_name="別名",
+    )
+    assert [row["id"] for row in matches] == [reservation["id"]]
+
+    service.update_status(reservation["id"], "cancelled")
+    assert service.find_future_reservations_for_customer(customer_phone="090-0000-0000") == []
+
+
+def test_status_change_option_label_includes_customer_datetime_and_menu(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    label = service.format_reservation_option(reservation)
+
+    assert "山田太郎" in label
+    assert "2026-05-18 10:00" in label
+    assert "30分相談" in label
+
+
 def test_create_demo_reservations_is_idempotent(tmp_path):
     service = make_service(tmp_path)
 

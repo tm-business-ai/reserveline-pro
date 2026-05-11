@@ -15,7 +15,13 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.line_webhook import handle_user_message
-from app.reservation_service import ReservationInput, ReservationService, STATUS_LABELS, WEEKDAY_KEYS
+from app.reservation_service import (
+    RESERVATION_SOURCE_LABELS,
+    ReservationInput,
+    ReservationService,
+    STATUS_LABELS,
+    WEEKDAY_KEYS,
+)
 from app.reminder_service import ReminderService
 from app.settings import get_settings
 
@@ -300,12 +306,25 @@ def format_datetime_text(value: object) -> str:
     return str(value).replace("T", " ") if value else ""
 
 
+def show_once_success(key: str) -> None:
+    message = st.session_state.pop(key, "")
+    if message:
+        st.success(message)
+
+
+def format_existing_reservation(row: dict) -> str:
+    status = STATUS_LABELS.get(row.get("status"), row.get("status", ""))
+    return f"既存予約：{format_datetime_text(row.get('reservation_datetime'))}｜{row.get('menu', '')}｜{status}"
+
+
 def to_dataframe(rows: list[dict], include_reminder_time: bool = False) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     if "status" in df.columns:
         df["予約状態"] = df["status"].map(STATUS_LABELS).fillna(df["status"])
+    if "reservation_source" in df.columns:
+        df["予約経路"] = df["reservation_source"].map(service.format_reservation_source)
     if "reservation_datetime" in df.columns:
         df["予約日時"] = df["reservation_datetime"].str.replace("T", " ", regex=False)
     if "reminder_sent" in df.columns:
@@ -316,7 +335,7 @@ def to_dataframe(rows: list[dict], include_reminder_time: bool = False) -> pd.Da
     rename_map = {
         "id": "予約ID",
         "customer_name": "顧客名",
-        "line_user_id": "LINEユーザーID",
+        "customer_phone": "電話番号",
         "menu": "メニュー",
         "notes": "備考",
         "created_at": "作成日時",
@@ -326,7 +345,8 @@ def to_dataframe(rows: list[dict], include_reminder_time: bool = False) -> pd.Da
     preferred_columns = [
         "予約ID",
         "顧客名",
-        "LINEユーザーID",
+        "電話番号",
+        "予約経路",
         "メニュー",
         "予約日時",
         "お知らせ予定日時",
@@ -479,10 +499,18 @@ elif page == "今週の予約":
 elif page == "電話・店頭予約の登録":
     st.subheader("電話・店頭予約の登録")
     st.write("電話や店頭で受けた予約を、店舗側で登録できます。")
+    show_once_success("reservation_created_message")
     menus = [m["name"] for m in service.list_menus(active_only=True)]
+    source_options = ["phone", "walk_in", "line", "other"]
     with st.form("create_reservation_form"):
         customer_name = st.text_input("顧客名", value="サンプル太郎")
-        line_user_id = st.text_input("LINEユーザーID", value="sample-user-001")
+        customer_phone = st.text_input("電話番号", value="", help="任意ですが、電話予約では入力しておくと同じお客様の予約確認に役立ちます。")
+        reservation_source = st.selectbox(
+            "予約経路",
+            source_options,
+            index=0,
+            format_func=lambda value: RESERVATION_SOURCE_LABELS[value],
+        )
         menu = st.selectbox("メニュー", menus, disabled=not menus)
         reservation_date = st.date_input("予約日", value=next_business_date())
         reservation_time = st.time_input("予約時間", value=datetime.strptime("10:00", "%H:%M").time())
@@ -493,15 +521,25 @@ elif page == "電話・店頭予約の登録":
             if not menus:
                 raise ValueError("受付中のメニューがありません。先にメニューを登録してください。")
             reservation_dt = datetime.combine(reservation_date, reservation_time)
+            existing_reservations = service.find_future_reservations_for_customer(
+                customer_phone=customer_phone,
+                customer_name=customer_name,
+            )
             reservation = service.create_reservation(
                 ReservationInput(
                     customer_name=customer_name,
-                    line_user_id=line_user_id,
+                    line_user_id="",
                     menu=menu,
                     reservation_datetime=reservation_dt,
+                    customer_phone=customer_phone,
+                    reservation_source=reservation_source,
                     notes=notes,
                 )
             )
+            if existing_reservations:
+                st.warning("このお客様には、すでに別の予約があります。重複登録でないか確認してください。")
+                for existing in existing_reservations:
+                    st.write(format_existing_reservation(existing))
             st.success(f"予約を登録しました。予約ID：{reservation['id']}")
         except ValueError as exc:
             st.error(str(exc))
@@ -512,8 +550,13 @@ elif page == "電話・店頭予約の登録":
     if not all_rows:
         st.write("変更できる予約がありません。")
     else:
-        id_options = [int(row["id"]) for row in all_rows]
-        selected_id = st.selectbox("予約ID", id_options)
+        row_by_id = {int(row["id"]): row for row in all_rows}
+        id_options = list(row_by_id)
+        selected_id = st.selectbox(
+            "変更する予約",
+            id_options,
+            format_func=lambda value: service.format_reservation_option(row_by_id[int(value)]),
+        )
         status = st.selectbox(
             "変更後の予約状態",
             options=list(STATUS_LABELS.keys()),
@@ -569,6 +612,8 @@ elif page == "予約メニューの設定":
 elif page == "予約ルールの設定":
     st.subheader("予約ルールの設定")
     st.write("営業日、営業時間、予約間隔、受付締切、予約可能期間を設定する画面です。ここで設定したルールに沿って予約可能な時間を判定します。")
+    show_once_success("rules_saved_message")
+    show_once_success("closed_date_message")
     rules = service.get_reservation_rules()
     with st.form("reservation_rules_form"):
         selected_days = st.multiselect(
@@ -613,7 +658,7 @@ elif page == "予約ルールの設定":
                 int(max_days),
                 timezone,
             )
-            st.success("予約ルールを保存しました。")
+            st.session_state["rules_saved_message"] = "予約ルールを保存しました。空き時間の確認画面で、変更後の予約可能時間を確認してください。"
             refresh()
         except ValueError as exc:
             st.error(str(exc))
@@ -653,7 +698,13 @@ elif page == "予約ルールの設定":
         new_active = st.checkbox("選択した休業日を有効にする", value=bool(selected_row["active"]))
         if st.button("臨時休業日の状態を変更する"):
             service.update_closed_date_status(int(selected_closed_id), bool(new_active))
-            st.success("臨時休業日の状態を変更しました。")
+            st.session_state["closed_date_message"] = (
+                "臨時休業日を有効にしました。" if bool(new_active) else "臨時休業日を無効にしました。"
+            )
+            refresh()
+        if st.button("臨時休業日を削除する"):
+            service.delete_closed_date(int(selected_closed_id))
+            st.session_state["closed_date_message"] = "臨時休業日を削除しました。"
             refresh()
 
 elif page == "空き時間の確認":
@@ -671,7 +722,13 @@ elif page == "空き時間の確認":
                 st.write("予約可能な時間一覧")
                 st.dataframe(pd.DataFrame({"予約可能時間": slots}), use_container_width=True, hide_index=True)
             else:
-                st.write("この日付で予約できる時間はありません。")
+                rules = service.get_reservation_rules()
+                if not service.is_business_day(target_date, rules):
+                    st.info("この日は営業曜日に含まれていないため、予約できる時間はありません。")
+                elif service.is_closed_date(target_date):
+                    st.info("この日は臨時休業日のため、予約できる時間はありません。")
+                else:
+                    st.info("この日付では、営業時間、予約締切、既存予約、メニュー所要時間の条件に合う空き時間がありません。")
         except ValueError as exc:
             st.error(str(exc))
 
