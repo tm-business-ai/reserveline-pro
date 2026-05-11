@@ -164,7 +164,7 @@ class ReservationService:
         return self.get_reservation(reservation_id)
 
     def cancel_latest_reservation(self, line_user_id: str) -> dict[str, Any] | None:
-        now = datetime.now().isoformat(timespec="minutes")
+        now = self._now().replace(tzinfo=None).isoformat(timespec="minutes")
         with get_connection(self.db_path) as conn:
             row = conn.execute(
                 """
@@ -191,7 +191,7 @@ class ReservationService:
         return self.get_reservation(reservation_id)
 
     def get_latest_upcoming_reservation(self, line_user_id: str) -> dict[str, Any] | None:
-        now = datetime.now().isoformat(timespec="minutes")
+        now = self._now().replace(tzinfo=None).isoformat(timespec="minutes")
         with get_connection(self.db_path) as conn:
             row = conn.execute(
                 """

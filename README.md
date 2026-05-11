@@ -248,6 +248,12 @@ python -m compileall app ui
 python -m pytest -q
 ```
 
+## 今後の拡張
+
+ReserveLine Proは現在、LINE予約受付・予約管理の基本機能を備えています。今後は、LINE公式アカウントとの本番接続、ボタン式予約、予約変更、予約前のお知らせ通知、予約枠設定の強化などを追加していく予定です。
+
+詳細は [docs/productization_plan.md](docs/productization_plan.md) を参照してください。
+
 ## 安全面について
 
 - APIキーや管理者パスワードは `.env` で管理します。
