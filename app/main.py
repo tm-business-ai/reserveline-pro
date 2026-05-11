@@ -28,7 +28,7 @@ scheduler = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
-    init_db(settings.database_path)
+    init_db(settings.database_path, settings)
     if settings.scheduler_enabled and BackgroundScheduler is not None:
         reminder_service = ReminderService()
         scheduler = BackgroundScheduler()

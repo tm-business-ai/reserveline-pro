@@ -58,6 +58,9 @@ class Settings:
     business_close_time: time = _to_time(os.getenv("BUSINESS_CLOSE_TIME"), "18:00")
     business_days: tuple[str, ...] = _to_business_days(os.getenv("BUSINESS_DAYS"))
     business_timezone: str = os.getenv("BUSINESS_TIMEZONE", "Asia/Tokyo")
+    slot_interval_minutes: int = int(os.getenv("SLOT_INTERVAL_MINUTES", "30"))
+    min_booking_notice_minutes: int = int(os.getenv("MIN_BOOKING_NOTICE_MINUTES", "120"))
+    max_booking_days_ahead: int = int(os.getenv("MAX_BOOKING_DAYS_AHEAD", "30"))
 
 
 def get_settings() -> Settings:

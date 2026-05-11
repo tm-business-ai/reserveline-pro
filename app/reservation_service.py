@@ -1,12 +1,12 @@
-"""Reservation and menu business logic."""
+"""Reservation, menu, and availability business logic."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, date, time, timedelta
+from datetime import date, datetime, time, timedelta
+from io import StringIO
 from typing import Any, Callable
 import csv
-from io import StringIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.database import get_connection, init_db
@@ -35,6 +35,17 @@ class ReservationInput:
     notes: str = ""
 
 
+@dataclass(frozen=True)
+class ReservationRules:
+    business_days: tuple[str, ...]
+    open_time: time
+    close_time: time
+    slot_interval_minutes: int
+    min_booking_notice_minutes: int
+    max_booking_days_ahead: int
+    timezone: str
+
+
 class ReservationService:
     def __init__(
         self,
@@ -45,7 +56,7 @@ class ReservationService:
         self.db_path = db_path
         self.settings = settings or get_settings()
         self.now_provider = now_provider
-        init_db(self.db_path)
+        init_db(self.db_path, self.settings)
 
     def create_reservation(self, data: ReservationInput) -> dict[str, Any]:
         if not data.customer_name.strip():
@@ -54,9 +65,11 @@ class ReservationService:
             raise ValueError("LINEユーザーIDが空です。")
         if not self.menu_exists(data.menu):
             raise ValueError(f"メニューが見つかりません: {data.menu}")
-        self.validate_reservation_datetime(data.reservation_datetime)
-        if self.has_conflicting_reservation(data.reservation_datetime):
-            raise ValueError("申し訳ありません。その日時はすでに予約が入っています。別の日時をお選びください。")
+
+        duration_minutes = self.get_menu_duration(data.menu)
+        self.validate_reservation_datetime(data.reservation_datetime, duration_minutes)
+        if self.has_conflicting_reservation(data.reservation_datetime, duration_minutes):
+            raise ValueError("その時間はすでに予約が入っています。別の時間を選んでください。")
 
         with get_connection(self.db_path) as conn:
             cur = conn.execute(
@@ -69,43 +82,215 @@ class ReservationService:
                     data.customer_name.strip(),
                     data.line_user_id.strip(),
                     data.menu.strip(),
-                    data.reservation_datetime.isoformat(timespec="minutes"),
+                    data.reservation_datetime.replace(tzinfo=None).isoformat(timespec="minutes"),
                     data.notes.strip(),
                 ),
             )
             reservation_id = cur.lastrowid
         return self.get_reservation(reservation_id)
 
-    def validate_reservation_datetime(self, reservation_dt: datetime) -> None:
-        now = self._now()
-        target = self._as_business_timezone(reservation_dt)
+    def validate_reservation_datetime(self, reservation_dt: datetime, duration_minutes: int | None = None) -> None:
+        rules = self.get_reservation_rules()
+        duration = duration_minutes or 0
+        now = self._now_for_rules(rules)
+        target = self._as_timezone(reservation_dt, rules.timezone)
+        target_naive = target.replace(tzinfo=None)
+
         if target <= now:
-            raise ValueError("過去の日時は予約できません。現在以降の日時を指定してください。")
+            raise ValueError("過去の日時は予約できません。現在以降の日時を選んでください。")
+        if target < now + timedelta(minutes=rules.min_booking_notice_minutes):
+            raise ValueError("直前すぎる予約は受け付けできません。別の時間を選んでください。")
+        if target.date() > now.date() + timedelta(days=rules.max_booking_days_ahead):
+            raise ValueError("予約できる期間を過ぎています。別の日付を選んでください。")
+        if not self.is_business_day(target.date(), rules):
+            raise ValueError("その日は営業日ではありません。別の日付を選んでください。")
+        if self.is_closed_date(target.date()):
+            raise ValueError("その日は臨時休業日のため予約できません。")
+        if not self.is_within_business_hours(target_naive, duration, rules):
+            start_time = target_naive.time().replace(second=0, microsecond=0)
+            if start_time < rules.open_time or start_time >= rules.close_time:
+                raise ValueError("営業時間外です。別の時間を選んでください。")
+            raise ValueError("選択したメニューの所要時間が営業時間内に収まりません。別の時間を選んでください。")
 
-        weekday = WEEKDAY_KEYS[target.weekday()]
-        if weekday not in self.settings.business_days:
-            raise ValueError("その曜日は定休日です。別の日付を指定してください。")
-
-        reservation_time = target.time().replace(second=0, microsecond=0)
-        if not (self.settings.business_open_time <= reservation_time < self.settings.business_close_time):
-            raise ValueError(
-                "営業時間外です。予約可能時間は "
-                f"{self.settings.business_open_time:%H:%M}〜{self.settings.business_close_time:%H:%M} です。"
-            )
-
-    def has_conflicting_reservation(self, reservation_dt: datetime) -> bool:
+    def has_conflicting_reservation(
+        self,
+        reservation_dt: datetime,
+        duration_minutes: int | None = None,
+        exclude_reservation_id: int | None = None,
+    ) -> bool:
+        start = reservation_dt.replace(tzinfo=None)
+        duration = duration_minutes or 0
+        end = start + timedelta(minutes=duration)
         with get_connection(self.db_path) as conn:
             placeholders = ",".join("?" for _ in CONFLICT_STATUSES)
-            row = conn.execute(
+            rows = conn.execute(
                 f"""
-                SELECT id FROM reservations
-                WHERE reservation_datetime = ?
-                  AND status IN ({placeholders})
+                SELECT id, menu, reservation_datetime FROM reservations
+                WHERE status IN ({placeholders})
+                  AND (? IS NULL OR id != ?)
+                """,
+                (*sorted(CONFLICT_STATUSES), exclude_reservation_id, exclude_reservation_id),
+            ).fetchall()
+        for row in rows:
+            existing_start = datetime.fromisoformat(row["reservation_datetime"]).replace(tzinfo=None)
+            existing_end = existing_start + timedelta(minutes=self.get_menu_duration(row["menu"]))
+            if existing_start < end and start < existing_end:
+                return True
+        return False
+
+    def get_reservation_rules(self) -> ReservationRules:
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM reservation_settings WHERE id = 1").fetchone()
+        if row is None:
+            init_db(self.db_path, self.settings)
+            return self.get_reservation_rules()
+        return ReservationRules(
+            business_days=tuple(day.strip() for day in row["business_days"].split(",") if day.strip()),
+            open_time=self._parse_time(row["open_time"], self.settings.business_open_time),
+            close_time=self._parse_time(row["close_time"], self.settings.business_close_time),
+            slot_interval_minutes=int(row["slot_interval_minutes"]),
+            min_booking_notice_minutes=int(row["min_booking_notice_minutes"]),
+            max_booking_days_ahead=int(row["max_booking_days_ahead"]),
+            timezone=row["timezone"] or self.settings.business_timezone,
+        )
+
+    def update_reservation_rules(
+        self,
+        business_days: tuple[str, ...] | list[str],
+        open_time: time,
+        close_time: time,
+        slot_interval_minutes: int,
+        min_booking_notice_minutes: int,
+        max_booking_days_ahead: int,
+        timezone: str,
+    ) -> ReservationRules:
+        clean_days = tuple(day for day in business_days if day in WEEKDAY_KEYS)
+        if not clean_days:
+            raise ValueError("営業曜日を1つ以上選んでください。")
+        if open_time >= close_time:
+            raise ValueError("営業終了時刻は営業開始時刻より後にしてください。")
+        if slot_interval_minutes <= 0:
+            raise ValueError("予約間隔は1分以上で入力してください。")
+        if min_booking_notice_minutes < 0:
+            raise ValueError("予約受付の締切時間は0分以上で入力してください。")
+        if max_booking_days_ahead <= 0:
+            raise ValueError("予約可能期間は1日以上で入力してください。")
+
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE reservation_settings
+                SET business_days = ?,
+                    open_time = ?,
+                    close_time = ?,
+                    slot_interval_minutes = ?,
+                    min_booking_notice_minutes = ?,
+                    max_booking_days_ahead = ?,
+                    timezone = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """,
+                (
+                    ",".join(clean_days),
+                    open_time.strftime("%H:%M"),
+                    close_time.strftime("%H:%M"),
+                    int(slot_interval_minutes),
+                    int(min_booking_notice_minutes),
+                    int(max_booking_days_ahead),
+                    timezone.strip() or "Asia/Tokyo",
+                ),
+            )
+        return self.get_reservation_rules()
+
+    def add_closed_date(self, closed_date: date, reason: str = "", active: bool = True) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO closed_dates (closed_date, reason, active)
+                VALUES (?, ?, ?)
+                """,
+                (closed_date.isoformat(), reason.strip(), int(active)),
+            )
+            row = conn.execute("SELECT * FROM closed_dates WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+    def list_closed_dates(self, active_only: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM closed_dates"
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY closed_date ASC, id ASC"
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_closed_date_status(self, closed_date_id: int, active: bool) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE closed_dates
+                SET active = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(active), closed_date_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"臨時休業日が見つかりません: {closed_date_id}")
+            row = conn.execute("SELECT * FROM closed_dates WHERE id = ?", (closed_date_id,)).fetchone()
+        return dict(row)
+
+    def is_business_day(self, target_date: date, rules: ReservationRules | None = None) -> bool:
+        rules = rules or self.get_reservation_rules()
+        return WEEKDAY_KEYS[target_date.weekday()] in rules.business_days
+
+    def is_closed_date(self, target_date: date) -> bool:
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM closed_dates
+                WHERE closed_date = ? AND active = 1
                 LIMIT 1
                 """,
-                (reservation_dt.isoformat(timespec="minutes"), *sorted(CONFLICT_STATUSES)),
+                (target_date.isoformat(),),
             ).fetchone()
         return row is not None
+
+    def is_within_business_hours(
+        self,
+        reservation_dt: datetime,
+        duration_minutes: int,
+        rules: ReservationRules | None = None,
+    ) -> bool:
+        rules = rules or self.get_reservation_rules()
+        start_time = reservation_dt.time().replace(second=0, microsecond=0)
+        end_dt = reservation_dt + timedelta(minutes=duration_minutes)
+        if end_dt.date() != reservation_dt.date():
+            return False
+        end_time = end_dt.time().replace(second=0, microsecond=0)
+        return rules.open_time <= start_time and end_time <= rules.close_time
+
+    def list_available_slots(self, target_date: date, menu_name: str) -> list[str]:
+        if not self.menu_exists(menu_name):
+            raise ValueError(f"メニューが見つかりません: {menu_name}")
+        rules = self.get_reservation_rules()
+        if not self.is_business_day(target_date, rules) or self.is_closed_date(target_date):
+            return []
+
+        duration = self.get_menu_duration(menu_name)
+        now = self._now_for_rules(rules)
+        if target_date > now.date() + timedelta(days=rules.max_booking_days_ahead):
+            return []
+
+        slots: list[str] = []
+        current = datetime.combine(target_date, rules.open_time)
+        close_dt = datetime.combine(target_date, rules.close_time)
+        while current + timedelta(minutes=duration) <= close_dt:
+            aware_current = self._as_timezone(current, rules.timezone)
+            earliest = now + timedelta(minutes=rules.min_booking_notice_minutes)
+            starts_after_notice = aware_current > earliest if rules.min_booking_notice_minutes == 0 else aware_current >= earliest
+            if starts_after_notice and not self.has_conflicting_reservation(current, duration):
+                slots.append(current.strftime("%H:%M"))
+            current += timedelta(minutes=rules.slot_interval_minutes)
+        return slots
 
     def get_reservation(self, reservation_id: int) -> dict[str, Any]:
         with get_connection(self.db_path) as conn:
@@ -249,7 +434,7 @@ class ReservationService:
                 skipped.append(existing)
                 continue
 
-            reservation_dt = self._find_available_demo_datetime(slot_index)
+            reservation_dt = self._find_available_demo_datetime(menu, slot_index)
             created.append(
                 self.create_reservation(
                     ReservationInput(
@@ -294,7 +479,7 @@ class ReservationService:
             ("reservation_datetime", "予約日時"),
             ("status", "予約状態"),
             ("notes", "備考"),
-            ("reminder_sent", "予約前のお知らせ済み"),
+            ("reminder_sent", "予約前のお知らせ送信済み"),
             ("created_at", "登録日時"),
             ("updated_at", "更新日時"),
         ]
@@ -315,54 +500,27 @@ class ReservationService:
             )
         return output.getvalue()
 
-    def _find_existing_demo_reservation(self, line_user_id: str, menu: str) -> dict[str, Any] | None:
-        now = self._now().isoformat(timespec="minutes")
-        with get_connection(self.db_path) as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM reservations
-                WHERE line_user_id = ?
-                  AND menu = ?
-                  AND notes = ?
-                  AND status IN ('reserved', 'confirmed', 'pending')
-                  AND reservation_datetime >= ?
-                ORDER BY reservation_datetime ASC
-                LIMIT 1
-                """,
-                (line_user_id, menu, DEMO_RESERVATION_NOTE, now),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def _find_available_demo_datetime(self, slot_index: int) -> datetime:
-        open_time = self.settings.business_open_time
-        candidate_time = time(
-            min(open_time.hour + 1 + (slot_index * 2), 23),
-            open_time.minute,
-        )
-        if candidate_time >= self.settings.business_close_time:
-            candidate_time = open_time
-
-        start_date = self._now().date()
-        for day_offset in range(0, 30):
-            candidate_date = start_date + timedelta(days=day_offset)
-            if WEEKDAY_KEYS[candidate_date.weekday()] not in self.settings.business_days:
-                continue
-            candidate_dt = datetime.combine(candidate_date, candidate_time)
-            if candidate_dt <= self._now().replace(tzinfo=None):
-                continue
-            if not self.has_conflicting_reservation(candidate_dt):
-                return candidate_dt
-        raise ValueError("サンプル予約を作成できる空き日時が見つかりませんでした。")
-
     def list_menus(self, active_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM menus"
-        params: list[Any] = []
         if active_only:
             sql += " WHERE active = 1"
         sql += " ORDER BY display_order ASC, id ASC"
         with get_connection(self.db_path) as conn:
-            rows = conn.execute(sql, params).fetchall()
+            rows = conn.execute(sql).fetchall()
         return [dict(row) for row in rows]
+
+    def get_menu(self, name: str) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM menus WHERE name = ? AND active = 1",
+                (name.strip(),),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"メニューが見つかりません: {name}")
+        return dict(row)
+
+    def get_menu_duration(self, name: str) -> int:
+        return int(self.get_menu(name)["duration_minutes"])
 
     def menu_exists(self, name: str) -> bool:
         with get_connection(self.db_path) as conn:
@@ -402,6 +560,36 @@ class ReservationService:
             row = conn.execute("SELECT * FROM menus WHERE name = ?", (clean_name,)).fetchone()
         return dict(row)
 
+    def _find_existing_demo_reservation(self, line_user_id: str, menu: str) -> dict[str, Any] | None:
+        now = self._now().replace(tzinfo=None).isoformat(timespec="minutes")
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM reservations
+                WHERE line_user_id = ?
+                  AND menu = ?
+                  AND notes = ?
+                  AND status IN ('reserved', 'confirmed', 'pending')
+                  AND reservation_datetime >= ?
+                ORDER BY reservation_datetime ASC
+                LIMIT 1
+                """,
+                (line_user_id, menu, DEMO_RESERVATION_NOTE, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _find_available_demo_datetime(self, menu: str, slot_index: int) -> datetime:
+        rules = self.get_reservation_rules()
+        start_date = self._now_for_rules(rules).date()
+        for day_offset in range(0, min(rules.max_booking_days_ahead, 30) + 1):
+            candidate_date = start_date + timedelta(days=day_offset)
+            slots = self.list_available_slots(candidate_date, menu)
+            if len(slots) > slot_index:
+                return datetime.combine(candidate_date, datetime.strptime(slots[slot_index], "%H:%M").time())
+            if slots:
+                return datetime.combine(candidate_date, datetime.strptime(slots[0], "%H:%M").time())
+        raise ValueError("サンプル予約を作成できる空き日時が見つかりませんでした。")
+
     @staticmethod
     def _date_to_start_datetime(value: date | datetime) -> datetime:
         if isinstance(value, datetime):
@@ -414,18 +602,37 @@ class ReservationService:
             return value
         return datetime.combine(value, datetime.max.time()).replace(microsecond=0)
 
+    @staticmethod
+    def _parse_time(value: str, default: time) -> time:
+        try:
+            hour_text, minute_text = value.split(":", 1)
+            return time(int(hour_text), int(minute_text))
+        except (AttributeError, TypeError, ValueError):
+            return default
+
     def _now(self) -> datetime:
         current = self.now_provider() if self.now_provider else datetime.now(self._business_zone())
         return self._as_business_timezone(current)
 
+    def _now_for_rules(self, rules: ReservationRules) -> datetime:
+        current = self.now_provider() if self.now_provider else datetime.now(self._zone_for_name(rules.timezone))
+        return self._as_timezone(current, rules.timezone)
+
     def _as_business_timezone(self, value: datetime) -> datetime:
-        zone = self._business_zone()
+        return self._as_timezone(value, self.settings.business_timezone)
+
+    def _as_timezone(self, value: datetime, timezone: str) -> datetime:
+        zone = self._zone_for_name(timezone)
         if value.tzinfo is None:
             return value.replace(tzinfo=zone)
         return value.astimezone(zone)
 
     def _business_zone(self) -> ZoneInfo:
+        return self._zone_for_name(self.settings.business_timezone)
+
+    @staticmethod
+    def _zone_for_name(timezone: str) -> ZoneInfo:
         try:
-            return ZoneInfo(self.settings.business_timezone)
+            return ZoneInfo(timezone)
         except ZoneInfoNotFoundError:
             return ZoneInfo("UTC")

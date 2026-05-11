@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import sys
 
@@ -374,11 +374,39 @@ def refresh() -> None:
 
 def next_business_date(start: date | None = None) -> date:
     current = start or date.today()
+    rules = service.get_reservation_rules()
     for offset in range(1, 15):
         candidate = current + timedelta(days=offset)
-        if WEEKDAY_KEYS[candidate.weekday()] in settings.business_days:
+        if service.is_business_day(candidate, rules) and not service.is_closed_date(candidate):
             return candidate
     return current + timedelta(days=1)
+
+
+WEEKDAY_LABELS = {
+    "mon": "月",
+    "tue": "火",
+    "wed": "水",
+    "thu": "木",
+    "fri": "金",
+    "sat": "土",
+    "sun": "日",
+}
+
+
+def to_closed_dates_dataframe(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["有効"] = df["active"].map(lambda value: "有効" if bool(value) else "無効")
+    display_df = df.rename(
+        columns={
+            "id": "ID",
+            "closed_date": "休業日",
+            "reason": "理由",
+            "created_at": "登録日時",
+        }
+    )
+    return display_df[["ID", "休業日", "理由", "有効", "登録日時"]]
 
 
 with st.sidebar:
@@ -392,6 +420,8 @@ with st.sidebar:
             "キャンセルされた予約",
             "予約データをダウンロード",
             "予約メニューの設定",
+            "予約ルールの設定",
+            "空き時間の確認",
             "予約前のお知らせ予定",
             "LINE予約の動作確認",
         ],
@@ -533,6 +563,115 @@ elif page == "予約メニューの設定":
             service.upsert_menu(name, int(duration), int(price), bool(active), int(display_order))
             st.success("メニューを保存しました。")
             refresh()
+        except ValueError as exc:
+            st.error(str(exc))
+
+elif page == "予約ルールの設定":
+    st.subheader("予約ルールの設定")
+    st.write("営業日、営業時間、予約間隔、受付締切、予約可能期間を設定する画面です。ここで設定したルールに沿って予約可能な時間を判定します。")
+    rules = service.get_reservation_rules()
+    with st.form("reservation_rules_form"):
+        selected_days = st.multiselect(
+            "営業曜日",
+            options=list(WEEKDAY_KEYS),
+            default=list(rules.business_days),
+            format_func=lambda key: WEEKDAY_LABELS[key],
+        )
+        open_time = st.time_input("営業開始時刻", value=rules.open_time)
+        close_time = st.time_input("営業終了時刻", value=rules.close_time)
+        slot_interval = st.selectbox(
+            "予約間隔（分）",
+            options=[15, 30, 60],
+            index=[15, 30, 60].index(rules.slot_interval_minutes)
+            if rules.slot_interval_minutes in [15, 30, 60]
+            else 1,
+        )
+        min_notice = st.number_input(
+            "予約受付の締切時間（分）",
+            min_value=0,
+            max_value=10080,
+            value=int(rules.min_booking_notice_minutes),
+            step=30,
+        )
+        max_days = st.number_input(
+            "予約可能期間（日）",
+            min_value=1,
+            max_value=365,
+            value=int(rules.max_booking_days_ahead),
+            step=1,
+        )
+        timezone = st.text_input("タイムゾーン", value=rules.timezone or "Asia/Tokyo")
+        rules_submitted = st.form_submit_button("予約ルールを保存する")
+    if rules_submitted:
+        try:
+            service.update_reservation_rules(
+                selected_days,
+                open_time,
+                close_time,
+                int(slot_interval),
+                int(min_notice),
+                int(max_days),
+                timezone,
+            )
+            st.success("予約ルールを保存しました。")
+            refresh()
+        except ValueError as exc:
+            st.error(str(exc))
+
+    current_rules = service.get_reservation_rules()
+    st.caption(
+        "現在の予約ルール: "
+        f"営業曜日 {', '.join(WEEKDAY_LABELS[day] for day in current_rules.business_days)} / "
+        f"営業時間 {current_rules.open_time:%H:%M}-{current_rules.close_time:%H:%M} / "
+        f"予約間隔 {current_rules.slot_interval_minutes}分 / "
+        f"受付締切 {current_rules.min_booking_notice_minutes}分前 / "
+        f"予約可能期間 {current_rules.max_booking_days_ahead}日"
+    )
+
+    st.divider()
+    st.subheader("臨時休業日の設定")
+    st.write("通常の定休日とは別に、臨時で予約を受け付けない日を設定できます。")
+    with st.form("closed_date_form"):
+        closed_date = st.date_input("休業日", value=date.today() + timedelta(days=1))
+        reason = st.text_input("理由", value="臨時休業")
+        active = st.checkbox("有効にする", value=True)
+        closed_submitted = st.form_submit_button("臨時休業日を追加する")
+    if closed_submitted:
+        service.add_closed_date(closed_date, reason, active)
+        st.success("臨時休業日を追加しました。")
+        refresh()
+
+    closed_rows = service.list_closed_dates(active_only=False)
+    closed_df = to_closed_dates_dataframe(closed_rows)
+    if closed_df.empty:
+        st.write("臨時休業日はまだ登録されていません。")
+    else:
+        st.dataframe(closed_df, use_container_width=True, hide_index=True)
+        closed_options = [int(row["id"]) for row in closed_rows]
+        selected_closed_id = st.selectbox("有効／無効を変更する休業日ID", closed_options)
+        selected_row = next(row for row in closed_rows if int(row["id"]) == int(selected_closed_id))
+        new_active = st.checkbox("選択した休業日を有効にする", value=bool(selected_row["active"]))
+        if st.button("臨時休業日の状態を変更する"):
+            service.update_closed_date_status(int(selected_closed_id), bool(new_active))
+            st.success("臨時休業日の状態を変更しました。")
+            refresh()
+
+elif page == "空き時間の確認":
+    st.subheader("空き時間の確認")
+    st.write("指定した日付とメニューに対して、予約可能な時間を確認できます。")
+    menus = [m["name"] for m in service.list_menus(active_only=True)]
+    target_date = st.date_input("日付", value=next_business_date())
+    selected_menu = st.selectbox("メニュー", menus, disabled=not menus)
+    if not menus:
+        st.write("受付中のメニューがありません。")
+    else:
+        try:
+            slots = service.list_available_slots(target_date, selected_menu)
+            if slots:
+                st.write("予約可能な時間一覧")
+                st.dataframe(pd.DataFrame({"予約可能時間": slots}), use_container_width=True, hide_index=True)
+            else:
+                st.write("この日付で予約できる時間はありません。")
         except ValueError as exc:
             st.error(str(exc))
 
