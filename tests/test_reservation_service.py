@@ -303,6 +303,31 @@ def test_closed_date_can_be_disabled_and_deleted(tmp_path):
     assert service.list_closed_dates(active_only=False) == []
 
 
+def test_closed_dates_can_be_deleted_in_bulk(tmp_path):
+    service = make_service(tmp_path)
+    first = service.add_closed_date(date(2026, 5, 18), "臨時休業", active=True)
+    second = service.add_closed_date(date(2026, 5, 19), "研修", active=True)
+    third = service.add_closed_date(date(2026, 5, 20), "棚卸", active=True)
+
+    deleted_count = service.delete_closed_dates([int(first["id"]), int(second["id"])])
+
+    assert deleted_count == 2
+    assert [row["id"] for row in service.list_closed_dates(active_only=False)] == [third["id"]]
+
+
+def test_closed_date_statuses_can_be_updated_in_bulk(tmp_path):
+    service = make_service(tmp_path)
+    first = service.add_closed_date(date(2026, 5, 18), "臨時休業", active=True)
+    second = service.add_closed_date(date(2026, 5, 19), "研修", active=False)
+
+    updated_count = service.update_closed_date_statuses({int(first["id"]): False, int(second["id"]): True})
+    rows = {int(row["id"]): row for row in service.list_closed_dates(active_only=False)}
+
+    assert updated_count == 2
+    assert rows[int(first["id"])]["active"] == 0
+    assert rows[int(second["id"])]["active"] == 1
+
+
 def test_create_reservation_saves_customer_phone_and_reservation_source(tmp_path):
     service = make_service(tmp_path)
 
@@ -319,6 +344,45 @@ def test_create_reservation_saves_customer_phone_and_reservation_source(tmp_path
 
     assert reservation["customer_phone"] == "090-0000-0000"
     assert reservation["reservation_source"] == "phone"
+
+
+def test_admin_reservation_can_use_available_slot_candidate(tmp_path):
+    service = make_service(tmp_path)
+    slots = service.list_available_slots(date(2026, 5, 18), "30分相談")
+    assert "09:00" in slots
+
+    reservation = service.create_reservation(
+        ReservationInput(
+            customer_name="山田太郎",
+            line_user_id="",
+            menu="30分相談",
+            reservation_datetime=datetime(2026, 5, 18, 9, 0),
+            customer_phone="090-0000-0000",
+            reservation_source="phone",
+        )
+    )
+
+    assert reservation["reservation_datetime"] == "2026-05-18T09:00"
+
+
+def test_closed_date_has_no_available_slots(tmp_path):
+    service = make_service(tmp_path)
+    service.add_closed_date(date(2026, 5, 18), "臨時休業", active=True)
+
+    assert service.list_available_slots(date(2026, 5, 18), "30分相談") == []
+
+
+def test_existing_reservation_is_removed_from_available_slots(tmp_path):
+    service = make_service(tmp_path)
+    service.create_reservation(
+        ReservationInput("山田太郎", "", "60分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    slots = service.list_available_slots(date(2026, 5, 18), "30分相談")
+
+    assert "10:00" not in slots
+    assert "10:30" not in slots
+    assert "11:00" in slots
 
 
 def test_find_future_reservations_for_same_customer(tmp_path):
@@ -355,6 +419,112 @@ def test_status_change_option_label_includes_customer_datetime_and_menu(tmp_path
     assert "山田太郎" in label
     assert "2026-05-18 10:00" in label
     assert "30分相談" in label
+
+
+def test_get_reservation_by_id_returns_existing_reservation(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    fetched = service.get_reservation_by_id(int(reservation["id"]))
+
+    assert fetched["id"] == reservation["id"]
+    assert fetched["customer_name"] == "山田太郎"
+
+
+def test_update_reservation_keeps_id_and_changes_fields(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    updated = service.update_reservation(
+        int(reservation["id"]),
+        ReservationInput(
+            customer_name="佐藤花子",
+            line_user_id="",
+            menu="60分相談",
+            reservation_datetime=datetime(2026, 5, 18, 11, 0),
+            customer_phone="090-1111-2222",
+            reservation_source="walk_in",
+            notes="時間変更",
+        ),
+        "confirmed",
+    )
+
+    assert updated["id"] == reservation["id"]
+    assert updated["customer_name"] == "佐藤花子"
+    assert updated["menu"] == "60分相談"
+    assert updated["reservation_datetime"] == "2026-05-18T11:00"
+    assert updated["status"] == "confirmed"
+    assert updated["reservation_source"] == "walk_in"
+
+
+def test_update_reservation_excludes_itself_from_conflict_check(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    updated = service.update_reservation(
+        int(reservation["id"]),
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone"),
+        "reserved",
+    )
+
+    assert updated["id"] == reservation["id"]
+    assert updated["reservation_datetime"] == "2026-05-18T10:00"
+
+
+def test_available_slots_can_exclude_target_reservation_for_edit(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    slots = service.list_available_slots(date(2026, 5, 18), "30分相談", exclude_reservation_id=int(reservation["id"]))
+
+    assert "10:00" in slots
+
+
+def test_update_reservation_rejects_other_reservation_conflict(tmp_path):
+    service = make_service(tmp_path)
+    first = service.create_reservation(
+        ReservationInput("山田太郎", "", "60分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+    second = service.create_reservation(
+        ReservationInput("佐藤花子", "", "30分相談", datetime(2026, 5, 18, 11, 0), reservation_source="walk_in")
+    )
+
+    try:
+        service.update_reservation(
+            int(second["id"]),
+            ReservationInput("佐藤花子", "", "30分相談", datetime(2026, 5, 18, 10, 30), reservation_source="walk_in"),
+            "reserved",
+        )
+    except ValueError as exc:
+        assert "その時間はすでに予約が入っています" in str(exc)
+    else:
+        raise AssertionError("他の予約と重なる更新が拒否されませんでした。")
+
+    assert service.get_reservation(int(first["id"]))["reservation_datetime"] == "2026-05-18T10:00"
+
+
+def test_reservation_option_label_includes_required_display_fields(tmp_path):
+    service = make_service(tmp_path)
+    reservation = service.create_reservation(
+        ReservationInput("山田太郎", "", "30分相談", datetime(2026, 5, 18, 10, 0), reservation_source="phone")
+    )
+
+    label = service.format_reservation_option(reservation)
+
+    assert f"#{reservation['id']}" in label
+    assert "山田太郎" in label
+    assert "2026-05-18 10:00" in label
+    assert "30分相談" in label
+    assert "予約中" in label
+    assert "電話" in label
 
 
 def test_create_demo_reservations_is_idempotent(tmp_path):

@@ -109,6 +109,54 @@ class ReservationService:
             reservation_id = cur.lastrowid
         return self.get_reservation(reservation_id)
 
+    def update_reservation(self, reservation_id: int, data: ReservationInput, status: str) -> dict[str, Any]:
+        if not data.customer_name.strip():
+            raise ValueError("顧客名が空です。")
+        if status not in VALID_STATUSES:
+            raise ValueError(f"不正なステータスです: {status}")
+        if not self.menu_exists(data.menu):
+            raise ValueError(f"メニューが見つかりません: {data.menu}")
+
+        self.get_reservation(reservation_id)
+        duration_minutes = self.get_menu_duration(data.menu)
+        if status in CONFLICT_STATUSES:
+            self.validate_reservation_datetime(data.reservation_datetime, duration_minutes)
+            if self.has_conflicting_reservation(
+                data.reservation_datetime,
+                duration_minutes,
+                exclude_reservation_id=reservation_id,
+            ):
+                raise ValueError("その時間はすでに予約が入っています。別の時間を選んでください。")
+
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE reservations
+                SET customer_name = ?,
+                    line_user_id = ?,
+                    customer_phone = ?,
+                    reservation_source = ?,
+                    menu = ?,
+                    reservation_datetime = ?,
+                    status = ?,
+                    notes = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    data.customer_name.strip(),
+                    data.line_user_id.strip(),
+                    data.customer_phone.strip(),
+                    self.normalize_reservation_source(data.reservation_source),
+                    data.menu.strip(),
+                    data.reservation_datetime.replace(tzinfo=None).isoformat(timespec="minutes"),
+                    status,
+                    data.notes.strip(),
+                    reservation_id,
+                ),
+            )
+        return self.get_reservation(reservation_id)
+
     def validate_reservation_datetime(self, reservation_dt: datetime, duration_minutes: int | None = None) -> None:
         rules = self.get_reservation_rules()
         duration = duration_minutes or 0
@@ -240,6 +288,15 @@ class ReservationService:
             if cur.rowcount == 0:
                 raise ValueError(f"臨時休業日が見つかりません: {closed_date_id}")
 
+    def delete_closed_dates(self, closed_date_ids: list[int]) -> int:
+        clean_ids = [int(closed_date_id) for closed_date_id in closed_date_ids]
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        with get_connection(self.db_path) as conn:
+            cur = conn.execute(f"DELETE FROM closed_dates WHERE id IN ({placeholders})", clean_ids)
+        return int(cur.rowcount)
+
     def list_closed_dates(self, active_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM closed_dates"
         if active_only:
@@ -263,6 +320,23 @@ class ReservationService:
                 raise ValueError(f"臨時休業日が見つかりません: {closed_date_id}")
             row = conn.execute("SELECT * FROM closed_dates WHERE id = ?", (closed_date_id,)).fetchone()
         return dict(row)
+
+    def update_closed_date_statuses(self, status_by_id: dict[int, bool]) -> int:
+        if not status_by_id:
+            return 0
+        with get_connection(self.db_path) as conn:
+            updated_count = 0
+            for closed_date_id, active in status_by_id.items():
+                cur = conn.execute(
+                    """
+                    UPDATE closed_dates
+                    SET active = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (int(active), int(closed_date_id)),
+                )
+                updated_count += int(cur.rowcount)
+        return updated_count
 
     def is_business_day(self, target_date: date, rules: ReservationRules | None = None) -> bool:
         rules = rules or self.get_reservation_rules()
@@ -294,7 +368,12 @@ class ReservationService:
         end_time = end_dt.time().replace(second=0, microsecond=0)
         return rules.open_time <= start_time and end_time <= rules.close_time
 
-    def list_available_slots(self, target_date: date, menu_name: str) -> list[str]:
+    def list_available_slots(
+        self,
+        target_date: date,
+        menu_name: str,
+        exclude_reservation_id: int | None = None,
+    ) -> list[str]:
         if not self.menu_exists(menu_name):
             raise ValueError(f"メニューが見つかりません: {menu_name}")
         rules = self.get_reservation_rules()
@@ -313,7 +392,7 @@ class ReservationService:
             aware_current = self._as_timezone(current, rules.timezone)
             earliest = now + timedelta(minutes=rules.min_booking_notice_minutes)
             starts_after_notice = aware_current > earliest if rules.min_booking_notice_minutes == 0 else aware_current >= earliest
-            if starts_after_notice and not self.has_conflicting_reservation(current, duration):
+            if starts_after_notice and not self.has_conflicting_reservation(current, duration, exclude_reservation_id):
                 slots.append(current.strftime("%H:%M"))
             current += timedelta(minutes=rules.slot_interval_minutes)
         return slots
@@ -324,6 +403,9 @@ class ReservationService:
         if row is None:
             raise ValueError(f"予約が見つかりません: {reservation_id}")
         return dict(row)
+
+    def get_reservation_by_id(self, reservation_id: int) -> dict[str, Any]:
+        return self.get_reservation(reservation_id)
 
     def list_reservations(
         self,
